@@ -9,7 +9,7 @@
 - 同一说话人的字幕时间不得重叠（属于输入合法性约束，非法返回 422）。
 - 分轨结果可作为**场景（scene）**按 `scene_id` 保存为版本化修订：新场景以 `expected_revision: 0` 创建（成功后版本 1），后续修订须带当前版本；版本不符返回 409。数据落在本地 SQLite，容器重启后仍可读取。
 - 已保存场景的指定时段可**另存为片段（clip）**：`POST /scenes/{id}/clip` 把 `[from_ms, to_ms)` 内相交字幕裁出并减去 `from_ms`，时间轴从 0 毫秒起，源分轨写入各条 `locked_track` 以保持原画面轨道，片段保存为 revision 1 的独立新场景；裁剪数据全部取自与 `expected_revision` 一致的**同一份完整源快照**——读取快照时先核对版本（不符立即 409，绝不拿错配版本裁剪），提交前在同一事务内再核对一次（读取匹配后源被修订同样 409），目标已占用返回 409、源不存在返回 404、窗口无相交字幕返回 422；失败不创建目标、不改源场景或播放会话。
-- 已保存场景可创建**播放会话（session）**：单进程内存态会话复制场景完整快照，游标从 0 毫秒开始推进（只能不减）；播放中可接纳场景的后续修订——已开始（`start_ms` ≤ 游标）的字幕保持原分轨，其余字幕按原最少换轨与并列规则重算。会话不跨重启保留。接纳是完整操作：场景读取、已开始字幕校验、分轨重算与会话替换在会话锁内串行生效，迟到的接纳请求读到的是轮到它生效时的场景快照，不会把会话回写到旧版本。除原 `/advance` 外，另有 `/events` 事件推进：一次推进返回跨过的**全部**字幕进入/退出事件，短字幕即使在两次采样之间开始又结束也不会漏掉。
+- 已保存场景可创建**播放会话（session）**：单进程内存态会话复制场景完整快照，游标从 0 毫秒开始推进（只能不减）；播放中可接纳场景的后续修订——已开始（`start_ms` ≤ 游标）的字幕保持原分轨，其余字幕按原最少换轨与并列规则重算。会话不跨重启保留。接纳是完整操作：场景读取、已开始字幕校验、分轨重算与会话替换在会话锁内串行生效，迟到的接纳请求读到的是轮到它生效时的场景快照，不会把会话回写到旧版本。除原 `/advance` 外，另有 `/events` 事件推进：一次推进返回跨过的**全部**字幕进入/退出事件，短字幕即使在两次采样之间开始又结束也不会漏掉。播放结束以 `POST /sessions/{id}/finish` **一次完整操作取回最终快照并释放会话**：成功响应沿用创建会话的全部字段，快照取自轮到结束时的会话（不读取尚未接纳的场景修订），未知会话返回 404；结束与同会话的推进、事件推进、接纳串行生效，并发结束最多一次成功，结束后针对该 id 的一切请求（含已取得会话引用但尚未生效的请求）均返回 404；不改动源场景、其他会话或此前返回的快照，不保存结束记录、不跨重启恢复。
 
 ## 一条命令启动
 
@@ -582,7 +582,7 @@ curl -s -X POST http://localhost:8080/sessions/$CID/events \
 
 ## 播放会话（session）：播放中接纳后续修订
 
-`/assign` 与 `/scenes` 都是无状态的计算/存储；播放会话则让“正在播放”的场景跟上后续修订：先按 `scene_id` 创建会话（复制场景当时的完整快照，游标从 0 毫秒开始），播放过程中推进游标，场景被修订后让会话接纳最新快照。会话是**单进程内存态**，不写入 SQLite、不跨重启保留；同一会话上的推进与接纳按完整操作串行生效（并发请求不会交错出中间态）。接纳的完整操作包含**场景读取本身**：请求在会话锁内才读取场景快照，因此并发下每个接纳请求应用的都是轮到它生效时的快照，会话的 `source_revision` 不会被迟到的请求回退。
+`/assign` 与 `/scenes` 都是无状态的计算/存储；播放会话则让“正在播放”的场景跟上后续修订：先按 `scene_id` 创建会话（复制场景当时的完整快照，游标从 0 毫秒开始），播放过程中推进游标，场景被修订后让会话接纳最新快照，播放结束时一次取回最终快照并释放会话。会话是**单进程内存态**，不写入 SQLite、不跨重启保留；同一会话上的推进、事件推进、接纳与结束按完整操作串行生效（并发请求不会交错出中间态）。接纳的完整操作包含**场景读取本身**：请求在会话锁内才读取场景快照，因此并发下每个接纳请求应用的都是轮到它生效时的快照，会话的 `source_revision` 不会被迟到的请求回退。结束的完整操作在会话锁内置墓碑并移除注册表条目：快照取自轮到结束时的会话（不读取尚未接纳的场景修订），并发结束最多一次成功，已取得会话引用但轮到它时会话已结束的请求一律 404。
 
 - `POST /sessions`：创建会话。请求体 `{"scene_id": "..."}`；场景不存在返回 404。响应为会话完整状态：`session_id`、`scene_id`、`source_revision`（快照来源的场景版本）、`cursor_ms`（初始 0）、`track_count`、`subtitles`、`assignments`、`changes`。
 - `POST /sessions/{session_id}/advance`：推进游标。请求体 `{"time_ms": N}`，`N` 为非负整数且**只能不减**（等于当前游标允许）；负数、非整数或倒退返回 422 且会话不变。响应含 `source_revision`、`cursor_ms` 与 `active`：游标时刻处于 `[start_ms, end_ms)`（左闭右开）区间的字幕及其轨道。
@@ -601,7 +601,12 @@ curl -s -X POST http://localhost:8080/sessions/$CID/events \
   - 按新快照顺序与最少换轨、并列规则重算全部分轨。
   - 场景读取、上述校验、分轨重算与会话替换是同一个完整操作，与同一会话的推进、其他接纳串行生效：并发接纳时，每个请求接纳的都是轮到它生效时的场景快照。
   - 冲突或无解返回 **409** 且会话不变；成功则整体替换会话快照与 `source_revision`（**场景本身不变**），返回会话最新完整状态。
-- 会话不存在（含服务重启后）返回 404。
+- `POST /sessions/{session_id}/finish`：**播放结束，取回最终快照并释放会话**。无请求体；以一次完整操作在会话锁内标记结束、移除注册表条目并返回最终快照：
+  - 成功 **200** 响应**沿用创建会话的全部字段**（`session_id`、`scene_id`、`source_revision`、`cursor_ms`、`track_count`、`changes`、`subtitles`、`assignments`）；快照取自**轮到结束生效时**的会话状态（含当时游标与已接纳快照），**不读取尚未接纳的场景修订**；
+  - 未知会话返回 **404**；并发结束**最多一次成功**，落败方返回 404；结束后针对该 id 的推进、事件推进、接纳、重复结束**一律 404**——包括已经取得会话引用、但在会话锁上等待、轮到它时会话已结束的请求；
+  - 结束与同会话的推进、事件推进、接纳**串行生效**（等待中的操作若先持锁则正常生效并进入最终快照，随后结束再生效）；
+  - 结束**不改动源场景、其他会话或此前返回的快照**；结束不保存记录、不跨重启恢复（重启后该 id 同样 404）。场景本身仍可读取，也可基于它创建新会话。
+- 会话不存在或已结束（含服务重启后）均返回 404。
 
 ### 示例 14：创建会话并推进游标
 
@@ -849,7 +854,124 @@ curl -s -X POST http://localhost:8080/sessions/$SID/events \
 
 事件与轨道全部来自**接纳后**的会话快照（s3 的 `end_ms` 已是 4000、s4 是修订新增的字幕、`source_revision` 为 2）；接纳失败（409）或尚未接纳的场景修订都不会影响事件——事件生成只读取轮到该请求生效时的会话快照，并与推进、接纳在会话锁内完整串行。4000 时刻 s3、s4 同为退出，按新快照的会话字幕顺序（s3 在 s4 前）排列。
 
-### 示例 18：播放中接纳场景修订
+### 示例 18：播放结束——finish 取回最终快照并保存响应，随后释放会话
+
+下面脚本可直接复制执行：创建场景 → 创建会话（创建响应也保存一份）→ 推进播放 → 场景被修订但**不接纳** → 结束并把**最终完整快照保存到文件** → 验证结束后一切请求 404、源场景与其他会话不受影响。
+
+```bash
+# 1) 创建场景（revision 1：s1[0,1000)、s2[800,3000) 锁轨 2、s3[1000,2500)）
+curl -s -X PUT http://localhost:8080/scenes/scene-finish \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "track_count": 2,
+    "expected_revision": 0,
+    "subtitles": [
+      {"id": "s1", "speaker": "Alice", "start_ms": 0,    "end_ms": 1000},
+      {"id": "s2", "speaker": "Bob",   "start_ms": 800,  "end_ms": 3000, "locked_track": 2},
+      {"id": "s3", "speaker": "Alice", "start_ms": 1000, "end_ms": 2500}
+    ]
+  }' >/dev/null
+
+# 2) 创建会话，并把创建响应快照保存为 /tmp/session-create.json
+SID=$(curl -s -X POST http://localhost:8080/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"scene_id": "scene-finish"}' \
+  | tee /tmp/session-create.json \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["session_id"])')
+
+# 播放：推进到 900（也可混用 /events、/accept）
+curl -s -X POST http://localhost:8080/sessions/$SID/advance \
+  -H 'Content-Type: application/json' -d '{"time_ms": 900}' >/dev/null
+
+# 3) 场景在此期间被修订为 revision 2（s3 延长到 4000），但会话不接纳
+curl -s -X PUT http://localhost:8080/scenes/scene-finish \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "track_count": 2, "expected_revision": 1,
+    "subtitles": [
+      {"id": "s1", "speaker": "Alice", "start_ms": 0,    "end_ms": 1000},
+      {"id": "s2", "speaker": "Bob",   "start_ms": 800,  "end_ms": 3000, "locked_track": 2},
+      {"id": "s3", "speaker": "Alice", "start_ms": 1000, "end_ms": 4000}
+    ]
+  }' >/dev/null
+
+# 4) 播放结束：一次完整操作取回最终快照并保存到 /tmp/session-final.json
+curl -s -X POST http://localhost:8080/sessions/$SID/finish \
+  | tee /tmp/session-final.json | python3 -m json.tool
+```
+
+```json
+{
+  "session_id": "…",
+  "scene_id": "scene-finish",
+  "source_revision": 1,
+  "cursor_ms": 900,
+  "track_count": 2,
+  "changes": 0,
+  "subtitles": [
+    {"id": "s1", "speaker": "Alice", "start_ms": 0,    "end_ms": 1000, "locked_track": null},
+    {"id": "s2", "speaker": "Bob",   "start_ms": 800,  "end_ms": 3000, "locked_track": 2},
+    {"id": "s3", "speaker": "Alice", "start_ms": 1000, "end_ms": 2500, "locked_track": null}
+  ],
+  "assignments": [
+    {"id": "s1", "track": 1},
+    {"id": "s2", "track": 2},
+    {"id": "s3", "track": 1}
+  ]
+}
+```
+
+结束响应与创建会话的字段完全相同；`cursor_ms` 为轮到结束时的游标（900），`subtitles`/`assignments` 是会话当时的快照。场景已被修订为 revision 2，但会话没有 `/accept`，因此结束快照仍是旧版本——**不读取尚未接纳的场景修订**（s3 的 `end_ms` 仍为 2500，`source_revision` 仍为 1）：
+
+```bash
+python3 -c 'import json; d=json.load(open("/tmp/session-final.json")); print(d["source_revision"], d["cursor_ms"], [s["end_ms"] for s in d["subtitles"] if s["id"]=="s3"])'
+# 1 900 [2500] —— 保存下来的结束快照停留在会话实际接纳的 revision 1
+```
+
+结束后该 id 的一切有效请求都返回 404，包括重复结束；未知会话同样 404：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/sessions/$SID/advance \
+  -H 'Content-Type: application/json' -d '{"time_ms": 1000}'   # 404
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/sessions/$SID/events \
+  -H 'Content-Type: application/json' -d '{"time_ms": 1000}'   # 404
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/sessions/$SID/accept   # 404
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/sessions/$SID/finish   # 404（重复结束）
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/sessions/no-such/finish  # 404（未知会话）
+```
+
+**并发结束最多一次成功**：另建一个会话，同时发起 8 次结束，恰好 1 个 200、7 个 404。
+
+```bash
+SID2=$(curl -s -X POST http://localhost:8080/sessions \
+  -H 'Content-Type: application/json' -d '{"scene_id": "scene-finish"}' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["session_id"])')
+rm -f /tmp/finish-codes
+for i in $(seq 1 8); do
+  (curl -s -o /dev/null -w '%{http_code}\n' \
+    -X POST http://localhost:8080/sessions/$SID2/finish >> /tmp/finish-codes) &
+done
+wait
+sort /tmp/finish-codes | uniq -c
+#       1 200
+#       7 404
+```
+
+源场景不受影响、仍然可读（revision 2 的修订照常存在），还可以基于它创建全新会话（游标从 0 毫秒开始、复制场景当前快照）；同场景的其他会话也照常播放：
+
+```bash
+curl -s http://localhost:8080/scenes/scene-finish \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["revision"])'
+# 2 —— 结束会话不会回滚或删除场景
+curl -s -X POST http://localhost:8080/sessions \
+  -H 'Content-Type: application/json' -d '{"scene_id": "scene-finish"}' \
+  | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d["cursor_ms"], d["source_revision"])'
+# 0 2 —— 全新会话从 0 毫秒、场景当前快照开始
+```
+
+结束与同会话的推进、事件推进、接纳**串行生效**：若某操作先拿到会话锁，则它先正常生效（其游标/接纳进入最终快照），随后结束再生效；已取得会话引用但轮到它时会话已结束的请求一律 404。结束不保存任何记录、不跨重启恢复（会话本就是内存态，重启后该 id 同样 404）；此前返回的快照（`/tmp/session-create.json`、`/tmp/session-final.json`）是独立拷贝，不受任何后续操作影响。
+
+### 示例 19：播放中接纳场景修订
 
 播放期间场景被修订（例如按示例 7 的方式把 `scene-001` 推进到 revision 2：s3 延长到 4000，并新增 s4 `[3200, 4000)`）。会话接纳最新快照：
 
@@ -877,7 +999,7 @@ curl -s -X POST http://localhost:8080/sessions/$SID/accept
 
 游标 900 时 s1、s2 已开始，保持原分轨 1、2 不变；s3、s4 在游标之后开始，按新快照重算分轨。`source_revision` 变为 2，场景本身的版本与内容不受接纳影响。
 
-### 示例 19：接纳冲突返回 409（会话不变）
+### 示例 20：接纳冲突返回 409（会话不变）
 
 若场景的修订动了已开始字幕（上例中游标 900 时修改了 s1 的起止时间、删除 s2、把轨道数改为 3，或新增的字幕在 900 之前开始等），接纳失败：
 
@@ -906,7 +1028,7 @@ HTTP/1.1 409 Conflict
 
 修复后，接纳把“读取场景快照 → 校验已开始字幕 → 重算分轨 → 替换会话状态”作为**完整操作**在会话锁内串行生效：场景读取发生在轮到该请求生效之时，因此迟到的请求接纳的一定是当时的场景快照——既不会把旧数据回写到会话上，也不会跳过旧数据却报告成功。会话的 `source_revision` 对同一会话只增不回退。请求、响应与错误码（200/404/409/422）均与之前兼容。
 
-### 示例 20：并发接纳——迟到请求不会回写旧快照
+### 示例 21：并发接纳——迟到请求不会回写旧快照
 
 ```bash
 # 1) 创建场景（版本 1：未开始的 s3 end_ms=2000）
@@ -998,10 +1120,10 @@ python tests/test_solver.py
 
 ```
 app/
-  main.py      # FastAPI 路由与请求/响应模型（Pydantic 校验），含片段另存 /scenes/{id}/clip
+  main.py      # FastAPI 路由与请求/响应模型（Pydantic 校验），含片段另存 /scenes/{id}/clip 与会话结束 /sessions/{id}/finish
   solver.py    # 纯 Python 求解器与业务校验（无第三方依赖）
   storage.py   # 场景持久化：本地 SQLite（乐观锁版本控制；片段核对源版本与创建目标为同一事务）
-  playback.py  # 播放会话：单进程内存态，推进/事件推进/接纳串行化（接纳含场景读取的完整操作）与保轨重算
+  playback.py  # 播放会话：单进程内存态，推进/事件推进/接纳/结束串行化（接纳含场景读取的完整操作；结束一次取回最终快照并移除注册表）与保轨重算
 tests/
   conftest.py        # pytest 夹具（场景接口使用临时数据库、会话隔离）
   test_solver.py     # 求解器单元测试
@@ -1009,6 +1131,7 @@ tests/
   test_scenes.py     # 场景创建/修订/读取/版本冲突/并发测试
   test_clips.py      # 片段另存：裁剪/保轨/边界、404/409/422、原子性、源与会话不变、独立性、快照错配回归
   test_playback.py   # 播放会话创建/推进/接纳/冲突/并发测试
+  test_finish.py     # 会话结束：最终快照字段、404、不读未接纳修订、并发结束唯一成功、等待中的推进/事件推进/接纳/重复结束可控交错
 Dockerfile
 docker-compose.yml   # 挂载 scenes-data 具名卷到 /data
 requirements.txt / requirements-dev.txt

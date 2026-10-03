@@ -18,12 +18,22 @@
   之后开始。随后按新快照顺序，以最少换轨与并列规则重算全部分轨。
   冲突或无解即失败且会话保持不变；成功则整体替换会话快照与源版本，
   场景本身不受影响。
+- 结束（finish）：一次完整操作取回会话最终完整快照并把会话从注册表
+  移除。结束与同一会话的推进、事件推进、接纳在会话锁内串行生效；
+  快照只取自轮到结束生效时的会话内存状态，不读取场景、因此不会纳入
+  尚未接纳的场景修订。成功响应沿用创建会话的全部字段。结束后该会话
+  ID 的一切请求（含已取得会话引用、在锁上等待的在途请求）均返回 404，
+  并发结束最多一次成功。结束不改动源场景、其他会话或此前返回的快照，
+  不保存结束记录，也不跨重启恢复。
 
-会话只存在于本进程内存中，不随重启保留。同一会话上的推进与接纳通过
-会话级互斥锁串行化：每次调用要么完整生效，要么完全无效。接纳是一个
-完整操作——场景快照的读取（load_record 回调）、已开始字幕校验、分轨
-重算与会话替换都在会话锁内完成，因此并发下迟到的接纳请求读到的一定
-是轮到它生效时的场景快照，不会把会话回写到进入锁之前读到的旧版本。
+会话只存在于本进程内存中，不随重启保留。同一会话上的推进、事件推进、
+接纳与结束通过会话级互斥锁串行化：每次调用要么完整生效，要么完全无效。
+接纳是一个完整操作——场景快照的读取（load_record 回调）、已开始字幕
+校验、分轨重算与会话替换都在会话锁内完成，因此并发下迟到的接纳请求
+读到的一定是轮到它生效时的场景快照，不会把会话回写到进入锁之前读到的
+旧版本。结束在会话锁内置位 closed 墓碑并移除注册表条目：先取得会话
+引用、在锁上排队的请求轮到它生效时会看到墓碑而失败（404），不会在
+结束之后再对已结束的会话生效一次。
 """
 from __future__ import annotations
 
@@ -63,6 +73,28 @@ class SceneUnavailable(Exception):
         super().__init__(f"场景 {scene_id!r} 不存在")
 
 
+class SessionMissing(Exception):
+    """注册表中不存在该会话 id（对应 HTTP 404）。"""
+
+    def __init__(self, session_id: str) -> None:
+        self.session_id = session_id
+        super().__init__(f"播放会话 {session_id!r} 不存在")
+
+
+class SessionFinished(Exception):
+    """会话已结束：请求已取得引用但轮到它生效时墓碑已置位（对应 HTTP 404）。
+
+    结束是完整操作：在会话锁内把 closed 置为 True 并移除注册表条目。
+    此前已取得 PlaybackSession 引用、正在会话锁上排队的推进/事件推进/
+    接纳/结束请求，轮到它生效时看到 closed 即按未知会话处理（404），
+    不会在结束之后再对该会话生效一次。
+    """
+
+    def __init__(self, session_id: str) -> None:
+        self.session_id = session_id
+        super().__init__(f"播放会话 {session_id!r} 已结束")
+
+
 @dataclass
 class PlaybackSession:
     """一次播放会话的内存状态；subtitles 与 tracks 按下标对齐。"""
@@ -75,6 +107,9 @@ class PlaybackSession:
     tracks: List[int]
     changes: int
     cursor_ms: int = 0
+    # 结束墓碑：finish 在会话锁内置为 True 并移除注册表条目。此后即使
+    # 仍持有本对象引用的在途请求，在锁内读到 closed 也一律按 404 失败。
+    closed: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def active(self) -> List[Dict[str, Any]]:
@@ -114,7 +149,12 @@ def _identity(sub: Dict[str, Any]) -> Tuple[Any, ...]:
 
 
 class PlaybackManager:
-    """会话注册表：单进程内存实现，不持久化、不跨重启保留。"""
+    """会话注册表：单进程内存实现，不持久化、不跨重启保留。
+
+    锁序约定为“会话锁 -> 注册表锁”：finish 先在注册表中查到会话，再
+    进入会话锁，最后在会话锁内取注册表锁移除条目。其余路径从不持有
+    注册表锁等待会话锁，因此不存在反向等待、不会死锁。
+    """
 
     def __init__(self) -> None:
         self._sessions: Dict[str, PlaybackSession] = {}
@@ -145,6 +185,8 @@ class PlaybackManager:
     def advance(self, session: PlaybackSession, time_ms: int) -> Dict[str, Any]:
         """推进游标（只能不减），返回源版本、游标与活动字幕及轨道。"""
         with session.lock:
+            if session.closed:
+                raise SessionFinished(session.session_id)
             if time_ms < session.cursor_ms:
                 raise CursorRegression(session.cursor_ms, time_ms)
             session.cursor_ms = time_ms
@@ -169,10 +211,12 @@ class PlaybackManager:
         进入；同类按会话字幕顺序。time_ms 等于当前游标时事件为空。
 
         事件生成、游标更新与活动字幕计算基于同一份会话快照，在会话锁
-        内一次完成，与推进、接纳完整串行。倒退抛 CursorRegression，
+        内一次完成，与推进、接纳、结束完整串行。倒退抛 CursorRegression，
         会话保持不变。事件不保存历史、不提供重放。
         """
         with session.lock:
+            if session.closed:
+                raise SessionFinished(session.session_id)
             if time_ms < session.cursor_ms:
                 raise CursorRegression(session.cursor_ms, time_ms)
             old_cursor = session.cursor_ms
@@ -216,11 +260,14 @@ class PlaybackManager:
         """接纳场景当前快照：读取场景、校验、重算分轨、替换会话为完整操作。
 
         load_record 在会话锁内调用，因此读到的是“轮到本次接纳生效时”的
-        场景快照；与同一会话的推进/接纳串行。这样并发下迟到的请求不会
-        把进入锁之前读到的旧快照回写到会话上。场景不存在抛
-        SceneUnavailable；冲突或无解抛 AcceptConflict，会话保持不变。
+        场景快照；与同一会话的推进/接纳/结束串行。这样并发下迟到的请求
+        不会把进入锁之前读到的旧快照回写到会话上。会话已结束抛
+        SessionFinished（404）；场景不存在抛 SceneUnavailable；冲突或
+        无解抛 AcceptConflict，会话保持不变。
         """
         with session.lock:
+            if session.closed:
+                raise SessionFinished(session.session_id)
             record = load_record()
             if record is None:
                 raise SceneUnavailable(session.scene_id)
@@ -281,4 +328,36 @@ class PlaybackManager:
             session.tracks = list(tracks)
             session.changes = changes
             session.source_revision = record.revision
+            return session.state()
+
+    def finish(self, session_id: str) -> Dict[str, Any]:
+        """结束会话：一次完整操作取回最终快照并移除注册表条目。
+
+        完整操作的定序为：先在注册表中查到会话，再进入会话锁，在锁内
+        置位 closed 墓碑并取出注册表条目，最后对轮到结束生效时的会话
+        状态取快照。与同一会话的推进、事件推进、接纳共用会话锁，因此
+        与它们完整串行：
+
+        - 快照只取自会话内存状态（session.state()），不读取场景存储，
+          不会纳入尚未被接纳的场景修订；
+        - 已取得会话引用但在锁上等待的在途请求，轮到它时看到 closed，
+          一律抛 SessionFinished（404），不会在结束之后再生效一次；
+        - 并发结束中第一个通过 closed 检查的请求成功，其余抛
+          SessionFinished；注册表已无条目时抛 SessionMissing；
+        - 不改动源场景、其他会话或此前返回的快照；不保存结束记录。
+
+        返回的字典沿用创建会话（state()）的全部响应字段。
+        """
+        with self._registry_lock:
+            session = self._sessions.get(session_id)
+        if session is None:
+            raise SessionMissing(session_id)
+        with session.lock:
+            if session.closed:
+                raise SessionFinished(session_id)
+            session.closed = True
+            with self._registry_lock:
+                # 注册表条目即本对象；以 closed 为准，防御性地按 id 移除
+                self._sessions.pop(session_id, None)
+            # state() 复制字幕与分轨：结束响应不受其后任何变化影响
             return session.state()
