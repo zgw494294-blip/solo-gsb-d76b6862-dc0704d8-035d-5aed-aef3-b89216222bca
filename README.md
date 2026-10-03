@@ -9,7 +9,7 @@
 - 同一说话人的字幕时间不得重叠（属于输入合法性约束，非法返回 422）。
 - 分轨结果可作为**场景（scene）**按 `scene_id` 保存为版本化修订：新场景以 `expected_revision: 0` 创建（成功后版本 1），后续修订须带当前版本；版本不符返回 409。数据落在本地 SQLite，容器重启后仍可读取。
 - 已保存场景的指定时段可**另存为片段（clip）**：`POST /scenes/{id}/clip` 把 `[from_ms, to_ms)` 内相交字幕裁出并减去 `from_ms`，时间轴从 0 毫秒起，源分轨写入各条 `locked_track` 以保持原画面轨道，片段保存为 revision 1 的独立新场景；裁剪数据全部取自与 `expected_revision` 一致的**同一份完整源快照**——读取快照时先核对版本（不符立即 409，绝不拿错配版本裁剪），提交前在同一事务内再核对一次（读取匹配后源被修订同样 409），目标已占用返回 409、源不存在返回 404、窗口无相交字幕返回 422；失败不创建目标、不改源场景或播放会话。
-- 已保存场景可创建**播放会话（session）**：单进程内存态会话复制场景完整快照，游标从 0 毫秒开始推进（只能不减）；播放中可接纳场景的后续修订——已开始（`start_ms` ≤ 游标）的字幕保持原分轨，其余字幕按原最少换轨与并列规则重算。会话不跨重启保留。接纳是完整操作：场景读取、已开始字幕校验、分轨重算与会话替换在会话锁内串行生效，迟到的接纳请求读到的是轮到它生效时的场景快照，不会把会话回写到旧版本。除原 `/advance` 外，另有 `/events` 事件推进：一次推进返回跨过的**全部**字幕进入/退出事件，短字幕即使在两次采样之间开始又结束也不会漏掉。
+- 已保存场景可创建**播放会话（session）**：单进程内存态会话复制场景完整快照，游标从 0 毫秒开始推进（只能不减）；播放中可接纳场景的后续修订——已开始（`start_ms` ≤ 游标）的字幕保持原分轨，其余字幕按原最少换轨与并列规则重算。会话不跨重启保留。接纳是完整操作：场景读取、已开始字幕校验、分轨重算与会话替换在会话锁内串行生效，迟到的接纳请求读到的是轮到它生效时的场景快照，不会把会话回写到旧版本。除原 `/advance` 外，另有 `/events` 事件推进：一次推进返回跨过的**全部**字幕进入/退出事件，短字幕即使在两次采样之间开始又结束也不会漏掉。播放结束调用 `POST /sessions/{id}/end`：以一次完整操作取回最终快照（字段同创建响应）并释放会话，此后该 id 的一切请求均返回 404。
 
 ## 一条命令启动
 
@@ -582,7 +582,7 @@ curl -s -X POST http://localhost:8080/sessions/$CID/events \
 
 ## 播放会话（session）：播放中接纳后续修订
 
-`/assign` 与 `/scenes` 都是无状态的计算/存储；播放会话则让“正在播放”的场景跟上后续修订：先按 `scene_id` 创建会话（复制场景当时的完整快照，游标从 0 毫秒开始），播放过程中推进游标，场景被修订后让会话接纳最新快照。会话是**单进程内存态**，不写入 SQLite、不跨重启保留；同一会话上的推进与接纳按完整操作串行生效（并发请求不会交错出中间态）。接纳的完整操作包含**场景读取本身**：请求在会话锁内才读取场景快照，因此并发下每个接纳请求应用的都是轮到它生效时的快照，会话的 `source_revision` 不会被迟到的请求回退。
+`/assign` 与 `/scenes` 都是无状态的计算/存储；播放会话则让“正在播放”的场景跟上后续修订：先按 `scene_id` 创建会话（复制场景当时的完整快照，游标从 0 毫秒开始），播放过程中推进游标，场景被修订后让会话接纳最新快照，播放结束时再取回最终快照并释放会话。会话是**单进程内存态**，不写入 SQLite、不跨重启保留；同一会话上的推进、事件推进、接纳与结束按完整操作串行生效（并发请求不会交错出中间态）。接纳的完整操作包含**场景读取本身**：请求在会话锁内才读取场景快照，因此并发下每个接纳请求应用的都是轮到它生效时的快照，会话的 `source_revision` 不会被迟到的请求回退。
 
 - `POST /sessions`：创建会话。请求体 `{"scene_id": "..."}`；场景不存在返回 404。响应为会话完整状态：`session_id`、`scene_id`、`source_revision`（快照来源的场景版本）、`cursor_ms`（初始 0）、`track_count`、`subtitles`、`assignments`、`changes`。
 - `POST /sessions/{session_id}/advance`：推进游标。请求体 `{"time_ms": N}`，`N` 为非负整数且**只能不减**（等于当前游标允许）；负数、非整数或倒退返回 422 且会话不变。响应含 `source_revision`、`cursor_ms` 与 `active`：游标时刻处于 `[start_ms, end_ms)`（左闭右开）区间的字幕及其轨道。
@@ -601,7 +601,12 @@ curl -s -X POST http://localhost:8080/sessions/$CID/events \
   - 按新快照顺序与最少换轨、并列规则重算全部分轨。
   - 场景读取、上述校验、分轨重算与会话替换是同一个完整操作，与同一会话的推进、其他接纳串行生效：并发接纳时，每个请求接纳的都是轮到它生效时的场景快照。
   - 冲突或无解返回 **409** 且会话不变；成功则整体替换会话快照与 `source_revision`（**场景本身不变**），返回会话最新完整状态。
-- 会话不存在（含服务重启后）返回 404。
+- `POST /sessions/{session_id}/end`：**结束会话**，取回最终快照并释放会话。
+  - 标记结束、复制最终快照与移除注册表条目在同一会话锁内作为**一次完整操作**生效，与同一会话的推进、事件推进、接纳串行：快照取自**轮到结束生效时**的会话状态（游标、源版本、字幕与分轨），只读会话自身，**不读取尚未接纳的场景修订**。
+  - 成功响应**沿用创建会话的全部响应字段**（`session_id`、`scene_id`、`source_revision`、`cursor_ms`、`track_count`、`changes`、`subtitles`、`assignments`）。
+  - 结束后该 `session_id` 的一切请求均返回 **404**——包括结束生效前已取得会话引用但尚未生效的在途请求；**并发结束最多一次成功**（其余 404）。
+  - 结束不改动源场景、其他会话与此前返回的快照；不保存结束记录、不跨重启恢复。
+- 会话不存在（含服务重启后、已结束后）返回 404。
 
 ### 示例 14：创建会话并推进游标
 
@@ -957,6 +962,70 @@ curl -s -X POST http://localhost:8080/sessions/$SID/advance \
 #  "active":[{"id":"s2",…,"track":2},{"id":"s3",…,"end_ms":4000,…,"track":1}]}
 ```
 
+### 示例 21：结束会话并保存最终快照（结束后该 id 一律 404）
+
+播放结束时，客户端调用结束接口，以一次完整操作取回最终快照并释放会话。下面是一段可直接复制执行的完整脚本：创建场景 → 建会话并推进到 900 → 结束会话并把最终快照保存到 `session-final.json`。
+
+```bash
+# 1) 准备场景（revision 1）并创建会话、推进到 900
+curl -s -X PUT http://localhost:8080/scenes/scene-end-demo \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "track_count": 2,
+    "expected_revision": 0,
+    "subtitles": [
+      {"id": "s1", "speaker": "Alice", "start_ms": 0,    "end_ms": 1000},
+      {"id": "s2", "speaker": "Bob",   "start_ms": 800,  "end_ms": 3000, "locked_track": 2},
+      {"id": "s3", "speaker": "Alice", "start_ms": 1000, "end_ms": 2500}
+    ]
+  }' >/dev/null
+
+SID=$(curl -s -X POST http://localhost:8080/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"scene_id": "scene-end-demo"}' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["session_id"])')
+
+curl -s -X POST http://localhost:8080/sessions/$SID/advance \
+  -H 'Content-Type: application/json' -d '{"time_ms": 900}' >/dev/null
+
+# 2) 结束会话：最终快照保存到 session-final.json，会话同时释放
+curl -s -X POST http://localhost:8080/sessions/$SID/end -o session-final.json
+cat session-final.json
+```
+
+```json
+{
+  "session_id": "9f2c…",
+  "scene_id": "scene-end-demo",
+  "source_revision": 1,
+  "cursor_ms": 900,
+  "track_count": 2,
+  "changes": 0,
+  "subtitles": [
+    {"id": "s1", "speaker": "Alice", "start_ms": 0,    "end_ms": 1000, "locked_track": null},
+    {"id": "s2", "speaker": "Bob",   "start_ms": 800,  "end_ms": 3000, "locked_track": 2},
+    {"id": "s3", "speaker": "Alice", "start_ms": 1000, "end_ms": 2500, "locked_track": null}
+  ],
+  "assignments": [
+    {"id": "s1", "track": 1},
+    {"id": "s2", "track": 2},
+    {"id": "s3", "track": 1}
+  ]
+}
+```
+
+成功响应沿用创建会话的全部字段，内容取自轮到结束生效时的会话（上例游标停在 900）。结束后该 `session_id` 的推进、事件推进、接纳与再次结束一律返回 404：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/sessions/$SID/advance \
+  -H 'Content-Type: application/json' -d '{"time_ms": 1000}'
+# 404
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/sessions/$SID/end
+# 404
+```
+
+结束只释放会话：源场景 `scene-end-demo` 的版本与内容不变（`curl -s http://localhost:8080/scenes/scene-end-demo` 仍是 revision 1），其他会话不受影响，此前保存的响应（如 `session-final.json`）也不会被改写。并发对同一会话调用结束时最多一次成功（其余 404）；结束不保存记录、不跨重启恢复。
+
 健康检查：
 
 ```bash
@@ -1001,7 +1070,7 @@ app/
   main.py      # FastAPI 路由与请求/响应模型（Pydantic 校验），含片段另存 /scenes/{id}/clip
   solver.py    # 纯 Python 求解器与业务校验（无第三方依赖）
   storage.py   # 场景持久化：本地 SQLite（乐观锁版本控制；片段核对源版本与创建目标为同一事务）
-  playback.py  # 播放会话：单进程内存态，推进/事件推进/接纳串行化（接纳含场景读取的完整操作）与保轨重算
+  playback.py  # 播放会话：单进程内存态，推进/事件推进/接纳/结束串行化（接纳含场景读取、结束含注册表移除的完整操作）与保轨重算
 tests/
   conftest.py        # pytest 夹具（场景接口使用临时数据库、会话隔离）
   test_solver.py     # 求解器单元测试
@@ -1009,6 +1078,7 @@ tests/
   test_scenes.py     # 场景创建/修订/读取/版本冲突/并发测试
   test_clips.py      # 片段另存：裁剪/保轨/边界、404/409/422、原子性、源与会话不变、独立性、快照错配回归
   test_playback.py   # 播放会话创建/推进/接纳/冲突/并发测试
+  test_session_end.py # 会话结束：快照字段、结束后 404、串行化与可控交错（在途推进/事件/接纳/重复结束）
 Dockerfile
 docker-compose.yml   # 挂载 scenes-data 具名卷到 /data
 requirements.txt / requirements-dev.txt

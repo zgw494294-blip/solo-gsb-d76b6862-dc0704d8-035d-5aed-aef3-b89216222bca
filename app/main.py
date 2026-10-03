@@ -14,6 +14,7 @@ from .playback import (
     PlaybackManager,
     PlaybackSession,
     SceneUnavailable,
+    SessionEnded,
 )
 from .solver import Subtitle, solve, validate
 from .storage import (
@@ -34,8 +35,10 @@ app = FastAPI(
         "播放会话（session）按 scene_id 创建内存态会话，游标推进中可接纳场景"
         "后续修订：已开始字幕保持原分轨，其余按原规则重算。事件推进接口返回"
         "一次推进跨过的全部字幕进入/退出事件，短字幕不会在两次采样之间漏掉。"
+        "播放结束时调用结束接口：以一次完整操作取回最终快照并释放会话，"
+        "此后该会话 id 的一切请求均返回 404。"
     ),
-    version="1.4.0",
+    version="1.5.0",
 )
 
 
@@ -599,16 +602,25 @@ def _get_session_or_404(session_id: str) -> PlaybackSession:
     return session
 
 
+def _session_gone_404(session_id: str) -> HTTPException:
+    """会话已结束或从未存在：统一按 404 报告（与未知会话同等对待）。"""
+    return HTTPException(
+        status_code=404, detail=f"播放会话 {session_id!r} 不存在"
+    )
+
+
 @app.post("/sessions/{session_id}/advance", response_model=AdvanceResponse)
 def advance_session(session_id: str, req: AdvanceRequest) -> AdvanceResponse:
     """推进游标到 time_ms（非负整数，只能不减）。
 
     返回源版本、游标，以及游标时刻处于 [start_ms, end_ms) 区间的字幕
-    及其轨道。倒退返回 422 且会话不变；会话不存在返回 404。
+    及其轨道。倒退返回 422 且会话不变；会话不存在或已结束返回 404。
     """
     session = _get_session_or_404(session_id)
     try:
         state = get_playback().advance(session, req.time_ms)
+    except SessionEnded:
+        raise _session_gone_404(session_id)
     except CursorRegression as exc:
         raise HTTPException(
             status_code=422,
@@ -636,13 +648,15 @@ def advance_session_events(
     事件按时刻升序；同一时刻先退出后进入；同类型按会话字幕顺序。
     响应还含推进后的活动字幕（[start_ms, end_ms)）、源版本与游标。
     等时推进（time_ms 等于当前游标）事件为空。事件生成与游标更新
-    在会话锁内与推进、接纳完整串行；事件不保存历史、不提供重放。
+    在会话锁内与推进、接纳、结束完整串行；事件不保存历史、不提供重放。
 
-    倒退或非法时间返回 422 且会话不变；会话不存在返回 404。
+    倒退或非法时间返回 422 且会话不变；会话不存在或已结束返回 404。
     """
     session = _get_session_or_404(session_id)
     try:
         state = get_playback().advance_events(session, req.time_ms)
+    except SessionEnded:
+        raise _session_gone_404(session_id)
     except CursorRegression as exc:
         raise HTTPException(
             status_code=422,
@@ -670,13 +684,15 @@ def accept_scene_revision(session_id: str) -> SessionStateResponse:
     - 按新快照顺序与最少换轨、并列规则重算全部分轨。
 
     冲突或无解返回 409 且会话不变；成功则整体替换会话快照与源版本
-    （场景本身不变），返回会话最新完整状态。
+    （场景本身不变），返回会话最新完整状态。会话不存在或已结束返回 404。
     """
     session = _get_session_or_404(session_id)
     try:
         state = get_playback().accept(
             session, lambda: get_store().get_scene(session.scene_id)
         )
+    except SessionEnded:
+        raise _session_gone_404(session_id)
     except SceneUnavailable:
         raise HTTPException(
             status_code=404, detail=f"场景 {session.scene_id!r} 不存在"
@@ -686,4 +702,26 @@ def accept_scene_revision(session_id: str) -> SessionStateResponse:
             status_code=409,
             detail={"message": str(exc), "scene_id": session.scene_id},
         )
+    return SessionStateResponse(**state)
+
+
+@app.post("/sessions/{session_id}/end", response_model=SessionStateResponse)
+def end_session(session_id: str) -> SessionStateResponse:
+    """结束播放会话：取回最终快照并释放会话。
+
+    标记结束、复制最终快照与移除注册表条目在同一会话锁内作为一次完整
+    操作生效，与同一会话的推进、事件推进、接纳串行：快照取自轮到结束
+    生效时的会话状态（游标、源版本、字幕与分轨），只读会话自身，不读取
+    尚未接纳的场景修订。成功响应沿用创建会话的全部响应字段。
+
+    结束后该 session_id 的一切请求均返回 404——包括结束生效前已取得
+    会话引用但尚未生效的在途请求；并发结束最多一次成功。结束不改动
+    源场景、其他会话与此前返回的快照，不保存结束记录、不跨重启恢复。
+    未知会话返回 404。
+    """
+    session = _get_session_or_404(session_id)
+    try:
+        state = get_playback().end(session)
+    except SessionEnded:
+        raise _session_gone_404(session_id)
     return SessionStateResponse(**state)

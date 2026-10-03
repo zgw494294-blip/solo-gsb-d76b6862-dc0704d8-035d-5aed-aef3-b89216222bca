@@ -18,12 +18,20 @@
   之后开始。随后按新快照顺序，以最少换轨与并列规则重算全部分轨。
   冲突或无解即失败且会话保持不变；成功则整体替换会话快照与源版本，
   场景本身不受影响。
+- 结束（end）：以一次完整操作取出会话最终快照并从注册表移除该会话。
+  快照只读会话自身状态（游标、源版本、字幕与分轨），不读取尚未接纳的
+  场景修订。结束后该 session_id 的一切请求都按未知会话处理——包括
+  结束生效前已取得会话引用、仍在等待会话锁的在途请求；并发结束最多
+  一次成功。结束不保存记录、不跨重启恢复。
 
-会话只存在于本进程内存中，不随重启保留。同一会话上的推进与接纳通过
-会话级互斥锁串行化：每次调用要么完整生效，要么完全无效。接纳是一个
-完整操作——场景快照的读取（load_record 回调）、已开始字幕校验、分轨
-重算与会话替换都在会话锁内完成，因此并发下迟到的接纳请求读到的一定
-是轮到它生效时的场景快照，不会把会话回写到进入锁之前读到的旧版本。
+会话只存在于本进程内存中，不随重启保留。同一会话上的推进、事件推进、
+接纳与结束通过会话级互斥锁串行化：每次调用要么完整生效，要么完全无效。
+接纳是一个完整操作——场景快照的读取（load_record 回调）、已开始字幕
+校验、分轨重算与会话替换都在会话锁内完成，因此并发下迟到的接纳请求读
+到的一定是轮到它生效时的场景快照，不会把会话回写到进入锁之前读到的旧
+版本。结束同样是一个完整操作——标记结束、复制最终快照与移除注册表条目
+都在会话锁内完成，因此快照取自轮到结束生效时的会话状态，且结束生效后
+任何在途请求进入会话锁时都会看到已结束标记而按未知会话失败。
 """
 from __future__ import annotations
 
@@ -63,6 +71,18 @@ class SceneUnavailable(Exception):
         super().__init__(f"场景 {scene_id!r} 不存在")
 
 
+class SessionEnded(Exception):
+    """会话已结束：结束后的一切在途/后续请求（对应 HTTP 404）。
+
+    与未知会话同等对待：结束生效前已取得会话引用、但进入会话锁时
+    结束先生效的请求，以及重复结束，都由此按 404 失败。
+    """
+
+    def __init__(self, session_id: str) -> None:
+        self.session_id = session_id
+        super().__init__(f"播放会话 {session_id!r} 已结束或不存在")
+
+
 @dataclass
 class PlaybackSession:
     """一次播放会话的内存状态；subtitles 与 tracks 按下标对齐。"""
@@ -75,6 +95,7 @@ class PlaybackSession:
     tracks: List[int]
     changes: int
     cursor_ms: int = 0
+    ended: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def active(self) -> List[Dict[str, Any]]:
@@ -145,6 +166,8 @@ class PlaybackManager:
     def advance(self, session: PlaybackSession, time_ms: int) -> Dict[str, Any]:
         """推进游标（只能不减），返回源版本、游标与活动字幕及轨道。"""
         with session.lock:
+            if session.ended:
+                raise SessionEnded(session.session_id)
             if time_ms < session.cursor_ms:
                 raise CursorRegression(session.cursor_ms, time_ms)
             session.cursor_ms = time_ms
@@ -169,10 +192,12 @@ class PlaybackManager:
         进入；同类按会话字幕顺序。time_ms 等于当前游标时事件为空。
 
         事件生成、游标更新与活动字幕计算基于同一份会话快照，在会话锁
-        内一次完成，与推进、接纳完整串行。倒退抛 CursorRegression，
+        内一次完成，与推进、接纳、结束完整串行。倒退抛 CursorRegression，
         会话保持不变。事件不保存历史、不提供重放。
         """
         with session.lock:
+            if session.ended:
+                raise SessionEnded(session.session_id)
             if time_ms < session.cursor_ms:
                 raise CursorRegression(session.cursor_ms, time_ms)
             old_cursor = session.cursor_ms
@@ -216,11 +241,13 @@ class PlaybackManager:
         """接纳场景当前快照：读取场景、校验、重算分轨、替换会话为完整操作。
 
         load_record 在会话锁内调用，因此读到的是“轮到本次接纳生效时”的
-        场景快照；与同一会话的推进/接纳串行。这样并发下迟到的请求不会
+        场景快照；与同一会话的推进/接纳/结束串行。这样并发下迟到的请求不会
         把进入锁之前读到的旧快照回写到会话上。场景不存在抛
         SceneUnavailable；冲突或无解抛 AcceptConflict，会话保持不变。
         """
         with session.lock:
+            if session.ended:
+                raise SessionEnded(session.session_id)
             record = load_record()
             if record is None:
                 raise SceneUnavailable(session.scene_id)
@@ -282,3 +309,28 @@ class PlaybackManager:
             session.changes = changes
             session.source_revision = record.revision
             return session.state()
+
+    def end(self, session: PlaybackSession) -> Dict[str, Any]:
+        """结束会话：取出最终快照并移除注册表条目，二者同属一次完整操作。
+
+        与同一会话的推进、事件推进、接纳在同一把会话锁内串行：轮到结束
+        生效时，先标记结束、复制当前完整快照（只读会话自身状态，不读取
+        尚未接纳的场景修订），再把 session_id 从注册表移除。此后该 id 的
+        一切请求都按未知会话处理：结束生效前已取得会话引用、仍在等待会话
+        锁的在途请求，进入锁时会看到已结束标记而抛 SessionEnded；之后再
+        到达的请求已无法从注册表取到会话。并发结束最多一次成功：先到者
+        在锁内完成结束，迟到者看到已结束标记。结束不保存记录、不跨重启
+        恢复；源场景、其他会话与此前返回的快照（state() 逐条复制）均不
+        受影响。
+        """
+        with session.lock:
+            if session.ended:
+                raise SessionEnded(session.session_id)
+            session.ended = True
+            state = session.state()
+            with self._registry_lock:
+                # 注册表里必定仍是本会话（结束标记在会话锁内置位，会话
+                # 只在结束时被移除）；按身份核对后再删除，纯防御。
+                if self._sessions.get(session.session_id) is session:
+                    del self._sessions[session.session_id]
+            return state
